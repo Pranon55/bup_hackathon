@@ -1,17 +1,45 @@
+import os
 import logging
-from fastapi import FastAPI, HTTPException
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from schemas import (
-    OptimizeEnergyRequest,
-    OptimizeEnergyResponse,
-    DirectiveInterpretation,
-    HourlyPlanItem,
+
+from schemas import OptimizeEnergyRequest, OptimizeEnergyResponse
+from interpreter import interpret_operator_notes
+from optimizer import optimize_energy_schedule
+from validator import replay_and_validate_plan
+
+# Load local .env if present
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("gridwise.main")
+
+app = FastAPI(
+    title="GridWise API",
+    version="2.0.0",
+    description="LLM-assisted 24-hour microgrid and energy schedule optimizer",
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("gridwise")
 
-app = FastAPI(title="GridWise API", version="1.0.0")
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Ensure malformed or missing fields return strict HTTP 400."""
+    logger.warning(f"Request validation error on {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=400,
+        content={
+            "detail": "Malformed or invalid request payload.",
+            "errors": [
+                {"loc": list(err.get("loc", [])), "msg": err.get("msg", "")}
+                for err in exc.errors()
+            ],
+        },
+    )
 
 
 @app.get("/health")
@@ -22,51 +50,45 @@ def health_check():
 @app.post("/optimize-energy", response_model=OptimizeEnergyResponse)
 def optimize_energy(request: OptimizeEnergyRequest):
     try:
-        interpretations = []
-        for i, _ in enumerate(request.operator_notes):
-            interpretations.append(
-                DirectiveInterpretation(
-                    note_index=i,
-                    applies=False,
-                    directive_type="no_op",
-                    structured_adjustment=None,
-                    explanation="Phase 1 stub: no-op applied.",
-                )
-            )
+        # 1. Interpret operator notes via LLM with guardrails
+        interpreted_directives = interpret_operator_notes(
+            notes=request.operator_notes,
+            capacity_kwh=float(request.battery.capacity_kwh),
+        )
 
-        hourly_plan = []
-        total_grid = 0.0
-        total_cost = 0.0
-        peak_grid = 0.0
+        # 2. Run deterministic linear program optimizer
+        hourly_plan, total_grid, total_cost, peak_grid, summary = optimize_energy_schedule(
+            hours=request.hours,
+            battery=request.battery,
+            directives=interpreted_directives,
+        )
 
-        for h in sorted(request.hours, key=lambda x: x.hour):
-            grid_kwh = round(float(h.demand_kwh), 4)
-            cost = grid_kwh * float(h.tariff_bdt_per_kwh)
-            total_grid += grid_kwh
-            total_cost += cost
-            if grid_kwh > peak_grid:
-                peak_grid = grid_kwh
+        # 3. Replay validator check
+        is_compliant = replay_and_validate_plan(
+            hours=request.hours,
+            battery=request.battery,
+            directives=interpreted_directives,
+            hourly_plan=hourly_plan,
+        )
+        if not is_compliant:
+            logger.warning(f"Scenario {request.scenario_id}: Replay validator noted non-fatal variance.")
 
-            hourly_plan.append(
-                HourlyPlanItem(
-                    hour=h.hour,
-                    grid_kwh=grid_kwh,
-                    solar_used_kwh=0.0,
-                    battery_action="idle",
-                    battery_kwh=0.0,
-                    battery_energy_after_kwh=round(float(request.battery.initial_energy_kwh), 4),
-                )
-            )
-
+        # 4. Construct response adhering strictly to schema
         return OptimizeEnergyResponse(
             scenario_id=request.scenario_id,
-            directive_interpretation=interpretations,
+            directive_interpretation=interpreted_directives,
             hourly_plan=hourly_plan,
-            total_grid_kwh=round(total_grid, 4),
-            total_cost_bdt=round(total_cost, 4),
-            peak_grid_kwh=round(peak_grid, 4),
-            plan_summary="Phase 1 baseline stub: meeting demand from grid with idle battery.",
+            total_grid_kwh=total_grid,
+            total_cost_bdt=total_cost,
+            peak_grid_kwh=peak_grid,
+            plan_summary=summary,
         )
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Unexpected error in /optimize-energy: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error during energy optimization.")
+        logger.error(f"Unexpected error in /optimize-energy: {type(e).__name__}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while processing the energy optimization request.",
+        )
